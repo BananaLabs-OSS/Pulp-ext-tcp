@@ -127,6 +127,40 @@ func TestBridgeCopiesBothDirections(t *testing.T) {
 	assertStreamCopy(t, rightClient, leftClient, []byte("right to left"))
 }
 
+func TestReadPrefaceCanReplayThenBridge(t *testing.T) {
+	m := newManager(slog.Default())
+	leftClient, leftHost := tcpPair(t)
+	rightClient, rightHost := tcpPair(t)
+	defer leftClient.Close()
+	defer rightClient.Close()
+	if err := m.reserve("cell-a"); err != nil {
+		t.Fatal(err)
+	}
+	left := m.addConnection("cell-a", leftHost)
+	if err := m.reserve("cell-a"); err != nil {
+		t.Fatal(err)
+	}
+	right := m.addConnection("cell-a", rightHost)
+	if _, err := leftClient.Write([]byte("minecraft-handshake")); err != nil {
+		t.Fatal(err)
+	}
+	preface, err := m.readPreface("cell-a", readRequest{ConnectionID: left.id, MaxBytes: 64, TimeoutMS: 1000})
+	if err != nil || string(preface) != "minecraft-handshake" {
+		t.Fatalf("preface=%q err=%v", preface, err)
+	}
+	if _, err := m.write("cell-a", writeRequest{ConnectionID: right.id, Payload: preface, TimeoutMS: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(preface))
+	if _, err := io.ReadFull(rightClient, got); err != nil || string(got) != string(preface) {
+		t.Fatalf("replayed=%q err=%v", got, err)
+	}
+	if err := m.bridge("cell-a", bridgeRequest{LeftID: left.id, RightID: right.id}); err != nil {
+		t.Fatal(err)
+	}
+	assertStreamCopy(t, leftClient, rightClient, []byte("opaque-after-preface"))
+}
+
 func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	t.Helper()
 	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})

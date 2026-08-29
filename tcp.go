@@ -55,6 +55,14 @@ type writeRequest struct {
 type writeResponse struct {
 	BytesWritten int `msgpack:"bytes_written"`
 }
+type readRequest struct {
+	ConnectionID uint64 `msgpack:"connection_id"`
+	MaxBytes     int    `msgpack:"max_bytes"`
+	TimeoutMS    int    `msgpack:"timeout_ms,omitempty"`
+}
+type readResponse struct {
+	Payload []byte `msgpack:"payload"`
+}
 type closeRequest struct {
 	ID uint64 `msgpack:"id"`
 }
@@ -101,13 +109,13 @@ type listener struct {
 	cancel context.CancelFunc
 }
 type connection struct {
-	id     uint64
-	cellID string
-	conn   *net.TCPConn
-	ctx    context.Context
-	cancel context.CancelFunc
+	id          uint64
+	cellID      string
+	conn        *net.TCPConn
+	ctx         context.Context
+	cancel      context.CancelFunc
 	readStarted bool
-	once   sync.Once
+	once        sync.Once
 }
 
 type manager struct {
@@ -309,6 +317,35 @@ func (m *manager) startRead(cellID string, id uint64) error {
 	m.mu.Unlock()
 	go m.readLoop(c.ctx, c)
 	return nil
+}
+
+func (m *manager) readPreface(cellID string, req readRequest) ([]byte, error) {
+	if req.MaxBytes <= 0 || req.MaxBytes > 64*1024 {
+		return nil, fmt.Errorf("TCP preface read must be between 1 and 65536 bytes")
+	}
+	m.mu.Lock()
+	c := m.connections[req.ConnectionID]
+	if c == nil || c.cellID != cellID {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("unknown or unowned TCP connection")
+	}
+	if c.readStarted {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("TCP connection already has an active reader")
+	}
+	m.mu.Unlock()
+	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+	if timeout <= 0 || timeout > 5*time.Second {
+		timeout = time.Second
+	}
+	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer c.conn.SetReadDeadline(time.Time{})
+	buffer := make([]byte, req.MaxBytes)
+	n, err := c.conn.Read(buffer)
+	if err != nil {
+		return nil, err
+	}
+	return buffer[:n], nil
 }
 
 // bridge moves bulk bytes directly between two cell-owned sockets. Policy and
@@ -630,6 +667,20 @@ func register(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		}
 		return respond(ctx, m, writeResponse{BytesWritten: v}, op, ol)
 	}).Export("tcp_write")
+	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, p, n, op, ol uint32) uint32 {
+		if active == nil {
+			return 10
+		}
+		var req readRequest
+		if c := request(m, p, n, &req); c != 0 {
+			return c
+		}
+		payload, err := active.readPreface(cellID, req)
+		if err != nil {
+			return 4
+		}
+		return respond(ctx, m, readResponse{Payload: payload}, op, ol)
+	}).Export("tcp_read_preface")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, p, n uint32) uint32 {
 		if active == nil {
 			return 10
@@ -703,6 +754,7 @@ func stub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_listen")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_connect")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_write")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_read_preface")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_start_read")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_bridge")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_half_close")

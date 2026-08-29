@@ -100,7 +100,9 @@ type connection struct {
 	id     uint64
 	cellID string
 	conn   *net.TCPConn
+	ctx    context.Context
 	cancel context.CancelFunc
+	start  sync.Once
 	once   sync.Once
 }
 
@@ -277,12 +279,24 @@ func (m *manager) acceptLoop(ctx context.Context, l *listener) {
 func (m *manager) addConnection(cellID string, conn *net.TCPConn) *connection {
 	id := m.nextID.Add(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &connection{id: id, cellID: cellID, conn: conn, cancel: cancel}
+	c := &connection{id: id, cellID: cellID, conn: conn, ctx: ctx, cancel: cancel}
 	m.mu.Lock()
 	m.connections[id] = c
 	m.mu.Unlock()
-	go m.readLoop(ctx, c)
 	return c
+}
+
+// startRead begins delivery only after the cell has installed its data
+// handler. Starting the goroutine in addConnection races fast clients with the
+// tcp.accepted event: tcp.data can otherwise arrive first and be discarded by
+// the cell-side registry before it knows the connection exists.
+func (m *manager) startRead(cellID string, id uint64) error {
+	c, err := m.owned(cellID, id)
+	if err != nil {
+		return err
+	}
+	c.start.Do(func() { go m.readLoop(c.ctx, c) })
+	return nil
 }
 
 func (m *manager) connect(cellID string, req connectRequest) (connectResponse, error) {
@@ -570,6 +584,19 @@ func register(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		if active == nil {
 			return 10
 		}
+		var req closeRequest
+		if c := request(m, p, n, &req); c != 0 {
+			return c
+		}
+		if active.startRead(cellID, req.ID) != nil {
+			return 4
+		}
+		return 0
+	}).Export("tcp_start_read")
+	b.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, p, n uint32) uint32 {
+		if active == nil {
+			return 10
+		}
 		var req halfCloseRequest
 		if c := request(m, p, n, &req); c != 0 {
 			return c
@@ -613,6 +640,7 @@ func stub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_listen")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_connect")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_write")
+	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_start_read")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_half_close")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_close")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_listener_close")

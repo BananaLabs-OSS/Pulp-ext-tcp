@@ -38,6 +38,9 @@ func TestManagerAcceptReadWriteOwnershipAndClose(t *testing.T) {
 	if accepted.RemoteAddr == "" || accepted.ConnectionID == 0 {
 		t.Fatalf("accepted=%#v", accepted)
 	}
+	if err := m.startRead("cell-a", accepted.ConnectionID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := m.write("cell-b", writeRequest{ConnectionID: accepted.ConnectionID, Payload: []byte("forbidden")}); err == nil {
 		t.Fatal("cross-cell write succeeded")
 	}
@@ -71,6 +74,35 @@ func TestManagerAcceptReadWriteOwnershipAndClose(t *testing.T) {
 	nextEvent(t, m, EventClosed)
 	if err := m.closeListener("cell-a", opened.ListenerID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAcceptedConnectionDoesNotDeliverDataBeforeStartRead(t *testing.T) {
+	m := newManager(slog.Default())
+	opened, err := m.listen("cell-a", listenRequest{Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := net.Dial("tcp", opened.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("eager handshake")); err != nil {
+		t.Fatal(err)
+	}
+	accepted := nextEvent(t, m, EventAccepted).value.(acceptedEvent)
+	select {
+	case ev := <-m.events:
+		t.Fatalf("event arrived before read start: %s", ev.kind)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := m.startRead("cell-a", accepted.ConnectionID); err != nil {
+		t.Fatal(err)
+	}
+	data := nextEvent(t, m, EventData).value.(dataEvent)
+	if string(data.Payload) != "eager handshake" {
+		t.Fatalf("payload=%q", data.Payload)
 	}
 }
 

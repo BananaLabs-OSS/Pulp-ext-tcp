@@ -58,6 +58,10 @@ type writeResponse struct {
 type closeRequest struct {
 	ID uint64 `msgpack:"id"`
 }
+type bridgeRequest struct {
+	LeftID  uint64 `msgpack:"left_id"`
+	RightID uint64 `msgpack:"right_id"`
+}
 type halfCloseRequest struct {
 	ConnectionID uint64 `msgpack:"connection_id"`
 	Direction    string `msgpack:"direction"`
@@ -102,7 +106,7 @@ type connection struct {
 	conn   *net.TCPConn
 	ctx    context.Context
 	cancel context.CancelFunc
-	start  sync.Once
+	readStarted bool
 	once   sync.Once
 }
 
@@ -291,11 +295,57 @@ func (m *manager) addConnection(cellID string, conn *net.TCPConn) *connection {
 // tcp.accepted event: tcp.data can otherwise arrive first and be discarded by
 // the cell-side registry before it knows the connection exists.
 func (m *manager) startRead(cellID string, id uint64) error {
-	c, err := m.owned(cellID, id)
-	if err != nil {
-		return err
+	m.mu.Lock()
+	c := m.connections[id]
+	if c == nil || c.cellID != cellID {
+		m.mu.Unlock()
+		return fmt.Errorf("unknown or unowned TCP connection")
 	}
-	c.start.Do(func() { go m.readLoop(c.ctx, c) })
+	if c.readStarted {
+		m.mu.Unlock()
+		return nil
+	}
+	c.readStarted = true
+	m.mu.Unlock()
+	go m.readLoop(c.ctx, c)
+	return nil
+}
+
+// bridge moves bulk bytes directly between two cell-owned sockets. Policy and
+// protocol adapters run before this transition; after it, the host preserves
+// stream ordering and backpressure without serializing every chunk through a
+// WASM step event.
+func (m *manager) bridge(cellID string, req bridgeRequest) error {
+	if req.LeftID == req.RightID {
+		return fmt.Errorf("bridge endpoints must be distinct")
+	}
+	m.mu.Lock()
+	left, right := m.connections[req.LeftID], m.connections[req.RightID]
+	if left == nil || right == nil || left.cellID != cellID || right.cellID != cellID {
+		m.mu.Unlock()
+		return fmt.Errorf("unknown or unowned TCP bridge endpoint")
+	}
+	if left.readStarted || right.readStarted {
+		m.mu.Unlock()
+		return fmt.Errorf("TCP bridge endpoint already has an active reader")
+	}
+	left.readStarted, right.readStarted = true, true
+	m.mu.Unlock()
+
+	var wg sync.WaitGroup
+	copyDirection := func(dst, src *connection) {
+		defer wg.Done()
+		_, _ = io.CopyBuffer(dst.conn, src.conn, make([]byte, defaultChunk))
+		_ = dst.conn.CloseWrite()
+	}
+	wg.Add(2)
+	go copyDirection(right, left)
+	go copyDirection(left, right)
+	go func() {
+		wg.Wait()
+		m.closeConnection(left, "TCP bridge closed")
+		m.closeConnection(right, "TCP bridge closed")
+	}()
 	return nil
 }
 
@@ -597,6 +647,19 @@ func register(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		if active == nil {
 			return 10
 		}
+		var req bridgeRequest
+		if c := request(m, p, n, &req); c != 0 {
+			return c
+		}
+		if active.bridge(cellID, req) != nil {
+			return 4
+		}
+		return 0
+	}).Export("tcp_bridge")
+	b.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, p, n uint32) uint32 {
+		if active == nil {
+			return 10
+		}
 		var req halfCloseRequest
 		if c := request(m, p, n, &req); c != 0 {
 			return c
@@ -641,6 +704,7 @@ func stub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_connect")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("tcp_write")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_start_read")
+	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_bridge")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_half_close")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_close")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("tcp_listener_close")

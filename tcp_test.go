@@ -106,6 +106,63 @@ func TestAcceptedConnectionDoesNotDeliverDataBeforeStartRead(t *testing.T) {
 	}
 }
 
+func TestBridgeCopiesBothDirections(t *testing.T) {
+	m := newManager(slog.Default())
+	leftClient, leftHost := tcpPair(t)
+	rightClient, rightHost := tcpPair(t)
+	defer leftClient.Close()
+	defer rightClient.Close()
+	if err := m.reserve("cell-a"); err != nil {
+		t.Fatal(err)
+	}
+	left := m.addConnection("cell-a", leftHost)
+	if err := m.reserve("cell-a"); err != nil {
+		t.Fatal(err)
+	}
+	right := m.addConnection("cell-a", rightHost)
+	if err := m.bridge("cell-a", bridgeRequest{LeftID: left.id, RightID: right.id}); err != nil {
+		t.Fatal(err)
+	}
+	assertStreamCopy(t, leftClient, rightClient, []byte("left to right"))
+	assertStreamCopy(t, rightClient, leftClient, []byte("right to left"))
+}
+
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	go func() {
+		conn, _ := ln.AcceptTCP()
+		accepted <- conn
+	}()
+	client, err := net.DialTCP("tcp", nil, ln.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, <-accepted
+}
+
+func assertStreamCopy(t *testing.T, from, to *net.TCPConn, payload []byte) {
+	t.Helper()
+	if _, err := from.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := to.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(to, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("payload=%q want=%q", got, payload)
+	}
+}
+
 func TestBindGuardFailsClosed(t *testing.T) {
 	t.Setenv("TCP_BIND_ALLOW", "127.0.0.1")
 	if err := checkBind("0.0.0.0:9000"); err == nil {

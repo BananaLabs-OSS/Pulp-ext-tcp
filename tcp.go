@@ -458,6 +458,7 @@ func (m *manager) write(cellID string, req writeRequest) (int, error) {
 		timeout = 5 * time.Second
 	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(timeout))
+	defer c.conn.SetWriteDeadline(time.Time{})
 	written := 0
 	for written < len(req.Payload) {
 		n, err := c.conn.Write(req.Payload[written:])
@@ -613,11 +614,12 @@ func respond(ctx context.Context, m api.Module, value any, outPtr, outLen uint32
 		return 7
 	}
 	result, err := alloc.Call(ctx, uint64(len(b)))
-	if err != nil || len(result) == 0 || result[0] == 0 {
+	if err != nil || len(result) == 0 || result[0] == 0 || result[0] > uint64(^uint32(0)) || uint64(len(b)) > uint64(^uint32(0)) {
 		return 7
 	}
-	ptr := uint32(result[0])
-	if !m.Memory().Write(ptr, b) || !m.Memory().WriteUint32Le(outPtr, ptr) || !m.Memory().WriteUint32Le(outLen, uint32(len(b))) {
+	ptr := uint32(result[0]) // #nosec G115 -- upper bound checked above
+	length := uint32(len(b)) // #nosec G115 -- upper bound checked above
+	if !m.Memory().Write(ptr, b) || !m.Memory().WriteUint32Le(outPtr, ptr) || !m.Memory().WriteUint32Le(outLen, length) {
 		return 8
 	}
 	return 0

@@ -148,13 +148,16 @@ func TestReadPrefaceCanReplayThenBridge(t *testing.T) {
 	if err != nil || string(preface) != "minecraft-handshake" {
 		t.Fatalf("preface=%q err=%v", preface, err)
 	}
-	if _, err := m.write("cell-a", writeRequest{ConnectionID: right.id, Payload: preface, TimeoutMS: 1000}); err != nil {
+	if _, err := m.write("cell-a", writeRequest{ConnectionID: right.id, Payload: preface, TimeoutMS: 40}); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]byte, len(preface))
 	if _, err := io.ReadFull(rightClient, got); err != nil || string(got) != string(preface) {
 		t.Fatalf("replayed=%q err=%v", got, err)
 	}
+	// A bounded policy write must not leave its deadline on the socket that is
+	// about to become a long-lived bridge.
+	time.Sleep(80 * time.Millisecond)
 	if err := m.bridge("cell-a", bridgeRequest{LeftID: left.id, RightID: right.id}); err != nil {
 		t.Fatal(err)
 	}

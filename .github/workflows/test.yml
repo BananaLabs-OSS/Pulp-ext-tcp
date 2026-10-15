@@ -1,18 +1,17 @@
-name: test
+name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go test -race ./...
+  test:
+    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@03801df76fc2698d80f3f83f44db6445de0506d2
+    with:
+      sibling-repositories: BananaLabs-OSS/Pulp
+      race: true

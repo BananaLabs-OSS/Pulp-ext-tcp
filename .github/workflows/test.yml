@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@03801df76fc2698d80f3f83f44db6445de0506d2
+    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@bdc81a8a0f751c60140d9d1505c56853475cc85f
     with:
       sibling-repositories: BananaLabs-OSS/Pulp
       race: true
